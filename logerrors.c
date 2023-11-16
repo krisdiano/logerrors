@@ -4,8 +4,10 @@
 #include "access/xact.h"
 #include "lib/stringinfo.h"
 #include "pgstat.h"
+#include "port.h"
 #include "executor/spi.h"
 #include "postmaster/bgworker.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
@@ -19,10 +21,18 @@
 #include "catalog/pg_authid.h"
 #include "utils/syscache.h"
 #include "access/htup_details.h"
+#include "time.h"
 #include "commands/dbcommands.h"
+#include "common/string.h"
+#include "common/file_perm.h"
 #include "utils/resowner.h"
 
 #include "constants.h"
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
 
 /* Allow load of this module in shared libs */
 PG_MODULE_MAGIC;
@@ -54,7 +64,13 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static void logerrors_shmem_request(void);
 #endif
 
-char* excluded_errcodes_str= NULL;
+static void write_to_stat_file(void);
+
+char* excluded_errcodes_str = NULL;
+char* stats_temp_directory = NULL;
+char* default_stats_temp_directory = "$pgdata/pg_stat_tmp";
+int stats_persistence_interval = 60000;
+
 
 typedef struct error_code {
     int num;
@@ -109,6 +125,8 @@ static GlobalInfo *global_variables = NULL;
 
 static HTAB *error_names_hashtable = NULL;
 
+static uint32 last_stats_counter[3] = {0};
+
 void logerrors_emit_log_hook(ErrorData *edata);
 
 static void
@@ -123,8 +141,8 @@ logerrors_sigterm(SIGNAL_ARGS)
 
 PGDLLEXPORT void logerrors_main(Datum) pg_attribute_noreturn();
 
-static void
-global_variables_init()
+        static void
+        global_variables_init()
 {
     int sqlstate;
     int errcodes_count;
@@ -184,12 +202,12 @@ add_message(int err_code, Oid db_oid, Oid user_oid, int message_type_index) {
     LWLockAcquire(&global_variables->messagesBuffer.lock, LW_EXCLUSIVE);
     current_message = pg_atomic_read_u32(&global_variables->messagesBuffer.current_message_index);
     index_to_write = global_variables->messagesBuffer.current_interval_index * messages_per_interval
-            + current_message;
+                     + current_message;
     if (current_message >= messages_per_interval) {
         /* too many messages per one interval, save current instead of random message in interval */
         srand(time(0));
         index_to_write = global_variables->messagesBuffer.current_interval_index * messages_per_interval +
-                rand() % messages_per_interval;
+                         rand() % messages_per_interval;
     }
 
     global_variables->messagesBuffer.buffer[index_to_write].db_oid = db_oid;
@@ -256,7 +274,7 @@ logerrors_update_info()
     LWLockAcquire(&global_variables->messagesBuffer.lock, LW_EXCLUSIVE);
     prev_index = global_variables->messagesBuffer.current_interval_index;
     global_variables->messagesBuffer.current_interval_index = (prev_index + 1)
-            % global_variables->actual_intervals_count;
+                                                              % global_variables->actual_intervals_count;
     current_index = global_variables->messagesBuffer.current_interval_index;
     for (i = 0; i < messages_per_interval; ++i) {
         global_variables->messagesBuffer.buffer[i + current_index * messages_per_interval].error_code = -1;
@@ -271,6 +289,8 @@ logerrors_update_info()
 void
 logerrors_main(Datum main_arg)
 {
+    int cur_dur = 0;
+
     /* Register functions for SIGTERM management */
     pqsignal(SIGTERM, logerrors_sigterm);
 
@@ -299,11 +319,188 @@ logerrors_main(Datum main_arg)
         }
         /* Main work happens here */
         logerrors_update_info();
+
+        cur_dur += interval;
+        if (cur_dur < stats_persistence_interval)
+            continue;
+        cur_dur = 0;
+        write_to_stat_file();
     }
 
     /* No problems, so clean exit */
     proc_exit(0);
 }
+
+static int
+create_dir_if_not_exist(char *dirname, bool *created, bool *empty)
+{
+    switch (pg_check_dir(dirname))
+    {
+        case 0:
+
+            /*
+             * Does not exist, so create
+             */
+            if (pg_mkdir_p(dirname, pg_dir_create_mode) == -1)
+                return -1;
+            if (created)
+                *created = true;
+            return 0;
+        case 1:
+
+            /*
+             * Exists, empty
+             */
+            if (empty)
+                *empty = true;
+            return 0;
+        case 2:
+        case 3:
+        case 4:
+
+            /*
+             * Exists, not empty
+             */
+            if (empty)
+                *empty =  false;
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+static void
+get_current_stats_file(char* path)
+{
+    char buf[32] = {0};
+    pg_time_t now = (pg_time_t)time(NULL);
+
+    pg_strftime(buf,
+                sizeof(buf),
+                "/stats-%Y-%m-%d.csv",
+                pg_localtime(&now, log_timezone));
+    strcat(path, "/");
+    strcat(path, buf);
+}
+
+static int
+replace_pgdata_env(char** path)
+{
+    if (!path || !(*path))
+        return -1;
+
+    if (strcmp(*path, "$pgdata") ==0)
+        return -1;
+    if (strcmp(*path, "$pgdata/") ==0)
+        return -1;
+    if (strncmp(*path, "$pgdata/", strlen("$pgdata/"))==0)
+        *path = *path + strlen("$pgdata/");
+    return 0;
+}
+
+static void
+remove_end_separator(char* path)
+{
+    char *ptr = NULL;
+    do
+    {
+        ptr = strrchr(path, '\\');
+        if (!ptr)
+            return;
+        if (*(ptr+1) == '\0')
+            *ptr = 0;
+    }
+    while(ptr);
+}
+
+static int
+create_file_if_not_exist(char* path)
+{
+    struct stat stat_buff;
+    int flags = O_RDWR|O_APPEND;
+
+    if (stat(path, &stat_buff) != 0)
+    {
+        if (errno != ENOENT)
+            return -1;
+        flags |= O_CREAT;
+    }
+    else
+    {
+        if (S_ISREG(stat_buff.st_mode) == 0)
+            return -1;
+    }
+    return OpenTransientFile(path, flags);
+}
+
+static void
+write_line_to_stat_file(int fd)
+{
+    uint32 tmp[3] = {0};
+    char buf[256] = {0};
+    char timebuf[64] = {0};
+    char msbuf[8] = {0};
+    struct timeval tv;
+    pg_time_t sec;
+
+    Assert(sizeof(tmp) == sizeof(last_stats_counter));
+
+    gettimeofday(&tv, NULL);
+    sec = (pg_time_t) tv.tv_sec;
+    pg_strftime(timebuf,
+                sizeof(timebuf),
+                "%Y-%m-%d %H:%M:%S        %Z",
+                pg_localtime(&sec, log_timezone));
+    sprintf(msbuf, ".%06d", (int) (tv.tv_usec));
+    strncpy(timebuf + 19, msbuf, 7);
+
+    tmp[0] = pg_atomic_read_u32(&global_variables->total_count[0]);
+    tmp[1] = pg_atomic_read_u32(&global_variables->total_count[1]);
+    tmp[2] = pg_atomic_read_u32(&global_variables->total_count[2]);
+
+    sprintf(buf, "%s,%d,%d,%d,0,0,0,0,0,0\n",
+            timebuf,
+            tmp[0]-last_stats_counter[0],
+            tmp[1]-last_stats_counter[1],
+            tmp[2]-last_stats_counter[2]);
+
+    write(fd, buf, strlen(buf));
+    memcpy(last_stats_counter, tmp, sizeof(tmp));
+}
+
+void
+write_to_stat_file()
+{
+
+    char stats_path[256] = {0};
+    char log_path[256] = {0};
+    int fd = -1;
+
+    if (global_variables == NULL)
+        return;
+
+    Assert(stats_temp_directory);
+    if (replace_pgdata_env(&stats_temp_directory) == -1)
+        return;
+    remove_end_separator(stats_temp_directory);
+
+    strcat(stats_path, stats_temp_directory);
+    strcat(stats_path, "/stats");
+    strcat(log_path, stats_temp_directory);
+    strcat(log_path, "/log");
+    if (create_dir_if_not_exist(stats_path, NULL, NULL) != 0)
+        return;
+    if (create_dir_if_not_exist(log_path, NULL, NULL) != 0)
+        return;
+
+    get_current_stats_file(stats_path);
+    fd = create_file_if_not_exist(stats_path);
+    if (fd < 0)
+        return;
+    write_line_to_stat_file(fd);
+    CloseTransientFile(fd);
+}
+
 
 /* Log hook */
 void
@@ -379,6 +576,28 @@ logerrors_load_params(void)
                                NULL,
                                NULL,
                                NULL);
+    DefineCustomStringVariable("logerrors.stats_temp_directory",
+                               "Stats will be persisted in this directory",
+                               NULL,
+                               &stats_temp_directory,
+                               default_stats_temp_directory,
+                               PGC_POSTMASTER,
+                               GUC_NO_RESET_ALL,
+                               NULL,
+                               NULL,
+                               NULL);
+    DefineCustomIntVariable("logerrors.stats_flush_interval",
+                            "Stats persistence interval",
+                            "Default of 60s, max of 5min",
+                            &stats_persistence_interval,
+                            60*1000,
+                            5*1000,
+                            5*60*1000,
+                            PGC_SUSET,
+                            GUC_UNIT_MS | GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
 }
 /*
  * Entry point for worker loading
@@ -434,9 +653,9 @@ logerrors_shmem_startup(void) {
     ctl.keysize = sizeof(ErrorCode);
     ctl.entrysize = sizeof(ErrorName);
     error_names_hashtable = ShmemInitHash("logerrors hash",
-                                            error_codes_count, error_codes_count,
-                                            &ctl,
-                                            HASH_ELEM | HASH_BLOBS);
+                                          error_codes_count, error_codes_count,
+                                          &ctl,
+                                          HASH_ELEM | HASH_BLOBS);
     global_variables = ShmemInitStruct("logerrors global_variables",
                                        sizeof(GlobalInfo),
                                        &found);
@@ -478,7 +697,7 @@ count_up_errors(int duration_in_intervals, int current_interval, HTAB* counters_
     /* put all messages to hashtable */
     for (i = duration_in_intervals; i > 0; --i) {
         interval_index = (current_interval - i + global_variables->actual_intervals_count)
-                % global_variables->actual_intervals_count;
+                         % global_variables->actual_intervals_count;
         for (j = 0; j < messages_per_interval; ++j) {
             message_index = interval_index * messages_per_interval + j;
             if (global_variables->messagesBuffer.buffer[message_index].error_code == -1)
@@ -526,7 +745,7 @@ put_values_to_tuple(
     count_up_errors(duration_in_intervals, current_interval_index, counters_hashtable);
     for (i = duration_in_intervals; i > 0; --i) {
         interval_index = (current_interval_index - i + global_variables->actual_intervals_count)
-                % global_variables->actual_intervals_count;
+                         % global_variables->actual_intervals_count;
         for (j = 0; j < messages_per_interval; ++j) {
             message_index = interval_index * messages_per_interval + j;
             if (global_variables->messagesBuffer.buffer[message_index].error_code == -1)
@@ -674,7 +893,7 @@ pg_log_errors_stats(PG_FUNCTION_ARGS)
     put_values_to_tuple(current_interval_index, 1, counters_hashtable, tupdesc, tupstore);
     /* long interval counters */
     put_values_to_tuple(current_interval_index, global_variables->intervals_count, counters_hashtable, tupdesc,
-            tupstore);
+                        tupstore);
     /* clean up */
     hash_destroy(counters_hashtable);
     /* return the tuplestore */
